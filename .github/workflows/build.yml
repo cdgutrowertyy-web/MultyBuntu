@@ -226,20 +226,15 @@ jobs:
       - name: Create user multy
         run: |
           sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
-          # Убрали set -e, чтобы не падать, если пользователь уже есть
+          set -e
           
-          # 1. Создаем базовые группы (без группы multy)
           for g in sudo audio video plugdev netdev lpadmin scanner bluetooth; do
             groupadd -f "$g" || true
           done
           
-          # 2. Флаг -U создаст пользователя и его группу multy автоматически
           useradd -U -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,lpadmin,scanner,bluetooth -c 'Multy User' multy || true
-          
-          # 3. Пытаемся поставить пароль
           echo 'multy:multy' | chpasswd || true
           
-          # 4. Права sudo
           echo 'multy ALL=(ALL) ALL' > /etc/sudoers.d/multy
           chmod 440 /etc/sudoers.d/multy
           SCRIPT
@@ -494,6 +489,8 @@ jobs:
           insmod search_fs_file
           insmod search_label
           insmod chain
+          insmod linux
+          insmod normal
 
           menuentry "MultyBuntu Live (UEFI)" {
               search --no-floppy --label MULTYBUNTU --set=root
@@ -518,12 +515,14 @@ jobs:
           set -e
           WORK=${{ github.workspace }}/build/image
           mkdir -p $WORK/EFI/boot
+          
+          # УБРАН initrd ИЗ СПИСКА МОДУЛЕЙ (вызывал ошибку)
           grub-mkstandalone \
             --format=x86_64-efi \
             --output=$WORK/EFI/boot/bootx64.efi \
             --locales="" \
             --fonts="" \
-            --modules="part_gpt part_msdos fat iso9660 udf loopback search_fs_uuid search_fs_file search_label normal linux initrd chain" \
+            --modules="part_gpt part_msdos fat iso9660 udf loopback search_fs_uuid search_fs_file search_label normal linux chain" \
             "boot/grub/grub.cfg=$WORK/boot/grub/grub.cfg"
 
           dd if=/dev/zero of=$WORK/boot/efi.img bs=1M count=20
@@ -559,7 +558,8 @@ jobs:
           cd ${{ github.workspace }}/build/image
           sudo find . -type f ! -name 'md5sum.txt' -print0 | sudo xargs -0 -r md5sum | sudo tee md5sum.txt > /dev/null
 
-          ISOHDPFX=$(find /usr/lib -name isohdpfx.bin 2>/dev/null | head -n1)
+          # УЛУЧШЕН ПОИСК isohdpfx.bin (поиск по всему /usr/lib и /usr/share)
+          ISOHDPFX=$(find /usr -name isohdpfx.bin 2>/dev/null | head -n1)
           if [ -z "$ISOHDPFX" ]; then
             echo "ERROR: isohdpfx.bin not found (install syslinux-common)"
             exit 1
