@@ -1,0 +1,603 @@
+name: Build MultyBuntu Live ISO
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: multybuntu-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify wallpaper asset exists
+        run: |
+          if [ ! -f files/wallpaper.png ]; then
+            echo "ERROR: files/wallpaper.png not found in repository!"
+            exit 1
+          fi
+
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debootstrap \
+            squashfs-tools \
+            xorriso \
+            isolinux \
+            syslinux-efi \
+            syslinux-utils \
+            syslinux-common \
+            mtools \
+            grub-common \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            dosfstools \
+            wget \
+            curl \
+            rsync
+
+      - name: Prepare build workspace
+        run: |
+          mkdir -p ${{ github.workspace }}/build/{chroot,image/casper,image/isolinux,image/boot/grub,image/EFI/boot}
+
+      - name: Bootstrap Ubuntu 24.04 (noble) base system
+        run: |
+          sudo debootstrap --arch=amd64 --variant=minbase \
+            --include=ca-certificates,apt-utils,locales,tzdata \
+            noble ${{ github.workspace }}/build/chroot \
+            https://archive.ubuntu.com/ubuntu/
+
+      - name: Configure apt sources (amd64 + i386)
+        run: |
+          sudo tee ${{ github.workspace }}/build/chroot/etc/apt/sources.list > /dev/null <<'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+          deb [arch=i386] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+          deb [arch=i386] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+          deb [arch=i386] http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+          EOF
+          sudo cp /etc/resolv.conf ${{ github.workspace }}/build/chroot/etc/resolv.conf
+
+      - name: Mount dev/proc/sys for chroot
+        run: |
+          sudo mount --bind /dev  ${{ github.workspace }}/build/chroot/dev
+          sudo mount --bind /proc ${{ github.workspace }}/build/chroot/proc
+          sudo mount --bind /sys  ${{ github.workspace }}/build/chroot/sys
+          sudo mount --bind /dev/pts ${{ github.workspace }}/build/chroot/dev/pts
+
+      - name: Add i386 architecture and update
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          dpkg --add-architecture i386
+          apt-get update
+          SCRIPT
+
+      - name: Pre-accept Steam license (debconf)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          echo "steam steam/question select I AGREE" | debconf-set-selections
+          echo "steam steam/license note ''" | debconf-set-selections
+          echo "steam steam/purge note ''" | debconf-set-selections
+          SCRIPT
+
+      - name: Install packages inside chroot
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends \
+            linux-image-generic \
+            casper \
+            laptop-detect \
+            os-prober \
+            network-manager \
+            plasma-nm \
+            kde-plasma-desktop \
+            sddm \
+            sddm-theme-breeze \
+            dolphin \
+            konsole \
+            gwenview \
+            ark \
+            qbittorrent \
+            steam-installer \
+            krita \
+            libreoffice \
+            gparted \
+            htop \
+            btop \
+            sudo \
+            locales \
+            keyboard-configuration \
+            console-setup \
+            xkb-data \
+            kio \
+            kinit \
+            plasma-framework \
+            qml-module-org-kde-kirigami2 \
+            fonts-dejavu \
+            fonts-noto \
+            nano \
+            vim-tiny \
+            wget \
+            curl \
+            gnupg2 \
+            rsync \
+            grub-common \
+            grub2-common \
+            grub-efi-amd64-bin \
+            grub-pc-bin \
+            mtools \
+            dosfstools \
+            squashfs-tools \
+            xorriso \
+            initramfs-tools \
+            systemd-sysv
+          SCRIPT
+
+      - name: Install Firefox (Mozilla APT repo, not snap)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          install -d -m 0755 /etc/apt/keyrings
+          wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
+            | gpg --dearmor > /etc/apt/keyrings/packages.mozilla.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.gpg] https://packages.mozilla.org/apt mozilla main" \
+            > /etc/apt/sources.list.d/mozilla.list
+          cat > /etc/apt/preferences.d/mozilla <<'EOF'
+          Package: *
+          Pin: origin packages.mozilla.org
+          Pin-Priority: 1000
+          EOF
+
+          apt-get update
+          apt-get install -y --no-install-recommends firefox
+          SCRIPT
+
+      - name: Install Wine (with recommends, for working wine32)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y wine wine32:i386
+          SCRIPT
+
+      - name: Configure system (hostname, locales, keyboard)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+
+          echo 'MultyBuntu' > /etc/hostname
+          printf '127.0.0.1 localhost\n127.0.1.1 MultyBuntu\n::1 localhost ip6-localhost ip6-loopback\n' > /etc/hosts
+
+          touch /etc/locale.gen
+          grep -q '^ru_RU.UTF-8' /etc/locale.gen || echo 'ru_RU.UTF-8 UTF-8' >> /etc/locale.gen
+          grep -q '^en_US.UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+          locale-gen
+
+          echo 'LANG=en_US.UTF-8' > /etc/default/locale
+          echo 'LANGUAGE=en_US:en' >> /etc/default/locale
+
+          cat > /etc/default/keyboard <<'EOF'
+          XKBMODEL="pc105"
+          XKBLAYOUT="us,ru"
+          XKBVARIANT=""
+          XKBOPTIONS="grp:lalt_lshift_toggle"
+          BACKSPACE="guess"
+          EOF
+
+          mkdir -p /etc/X11/xorg.conf.d
+          cat > /etc/X11/xorg.conf.d/00-keyboard.conf <<'EOF'
+          Section "InputClass"
+              Identifier "system-keyboard"
+              MatchIsKeyboard "on"
+              Option "XkbLayout" "us,ru"
+              Option "XkbOptions" "grp:lalt_lshift_toggle"
+          EndSection
+          EOF
+          SCRIPT
+
+      - name: Create user multy
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          groupadd -f multy || true
+          for g in sudo audio video plugdev netdev lpadmin scanner bluetooth; do
+            groupadd -f "$g" || true
+          done
+          useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,lpadmin,scanner,bluetooth -c 'Multy User' multy || true
+          echo 'multy:multy' | chpasswd
+          echo 'root:root' | chpasswd
+          echo 'multy ALL=(ALL) ALL' > /etc/sudoers.d/multy
+          chmod 440 /etc/sudoers.d/multy
+          SCRIPT
+
+      - name: Setup SDDM (no autologin)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          mkdir -p /etc/sddm.conf.d
+          cat > /etc/sddm.conf.d/10-multybuntu.conf <<'EOF'
+          [Autologin]
+          Relogin=false
+          Session=
+          User=
+
+          [Users]
+          MaximumUid=60000
+          MinimumUid=1000
+          HideUsers=
+          HideShells=
+          RememberLastUser=false
+
+          [General]
+          HaltCommand=/usr/bin/systemctl poweroff
+          RebootCommand=/usr/bin/systemctl reboot
+          Numlock=on
+          EOF
+
+          ln -sf /lib/systemd/system/sddm.service /etc/systemd/system/display-manager.service
+          ln -sf /lib/systemd/system/graphical.target /etc/systemd/system/default.target
+          SCRIPT
+
+      - name: Configure KDE keyboard layout (kxkbrc)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          mkdir -p /etc/skel/.config
+          cat > /etc/skel/.config/kxkbrc <<'EOF'
+          [Layout]
+          DisplayNames=,
+          LayoutList=us,ru
+          LayoutLoopCount=-1
+          Model=pc105
+          Options=grp:lalt_lshift_toggle
+          ResetOldOptions=true
+          ShowFlag=true
+          ShowLayoutIndicator=true
+          ShowSingle=false
+          SwitchMode=Global
+          Use=true
+          VariantList=,
+          EOF
+
+          mkdir -p /home/multy/.config
+          cp /etc/skel/.config/kxkbrc /home/multy/.config/kxkbrc
+          chown -R multy:multy /home/multy/.config
+          SCRIPT
+
+      - name: Install wallpaper for KDE Plasma and SDDM
+        run: |
+          set -e
+          sudo mkdir -p ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images
+          sudo cp files/wallpaper.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/3840x2160.png
+          sudo cp files/wallpaper.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/1920x1080.png
+
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+
+          cat > /usr/share/wallpapers/MultyBuntu/metadata.json <<'EOF'
+          {
+              "KPlugin": {
+                  "Id": "MultyBuntu",
+                  "Name": "MultyBuntu Default",
+                  "License": "GPL",
+                  "Authors": [{"Name": "MultyBuntu"}]
+              },
+              "X-KDE-PluginInfo-Author": "MultyBuntu",
+              "X-KDE-PluginInfo-Name": "MultyBuntu"
+          }
+          EOF
+
+          mkdir -p /etc/skel/.config
+          cat > /etc/skel/.config/plasma-org.kde.plasma.desktop-appletsrc <<'EOF'
+          [Containments][1]
+          activityId=
+          formfactor=0
+          lastScreen=0
+          location=0
+          plugin=org.kde.plasma.folder
+          wallpaperplugin=org.kde.image
+
+          [Containments][1][Wallpaper][org.kde.image][General]
+          Image=file:///usr/share/wallpapers/MultyBuntu/contents/images/3840x2160.png
+          FillMode=2
+          EOF
+
+          mkdir -p /home/multy/.config
+          cp /etc/skel/.config/plasma-org.kde.plasma.desktop-appletsrc /home/multy/.config/
+          chown -R multy:multy /home/multy/.config
+
+          mkdir -p /etc/sddm.conf.d
+          cat > /etc/sddm.conf.d/20-theme.conf <<'EOF'
+          [Theme]
+          Current=breeze
+          CursorTheme=breeze_cursors
+          EOF
+
+          mkdir -p /usr/share/sddm/themes/breeze
+          cat > /usr/share/sddm/themes/breeze/theme.conf.user <<'EOF'
+          [General]
+          background=file:///usr/share/wallpapers/MultyBuntu/contents/images/3840x2160.png
+          type=image
+          EOF
+          SCRIPT
+
+      - name: Create Desktop shortcut (Firefox) and Readmy txt for skel
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          mkdir -p /etc/skel/Desktop
+          cat > '/etc/skel/Desktop/firefox.desktop' <<'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Firefox
+          GenericName=Web Browser
+          Comment=Browse the World Wide Web
+          Exec=firefox %u
+          Icon=firefox
+          Terminal=false
+          Categories=Network;WebBrowser;
+          MimeType=text/html;text/xml;application/xhtml+xml;
+          StartupNotify=true
+          EOF
+          chmod +x '/etc/skel/Desktop/firefox.desktop'
+
+          cat > '/etc/skel/Desktop/README.txt' <<'EOF'
+          Предустановленные программы: см. папку "pre-installed programs" в корне загрузочного ISO-диска.
+          EOF
+          SCRIPT
+
+      - name: Finalize chroot
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          apt-get clean
+          rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+          SCRIPT
+
+      - name: Create live user home copy from skel
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          mkdir -p /home/multy/Desktop /home/multy/.config
+          cp -a /etc/skel/Desktop/. /home/multy/Desktop/ 2>/dev/null || true
+          cp -a /etc/skel/.config/. /home/multy/.config/ 2>/dev/null || true
+          chown -R multy:multy /home/multy/Desktop /home/multy/.config 2>/dev/null || true
+          chmod +x /home/multy/Desktop/*.desktop 2>/dev/null || true
+          SCRIPT
+
+      - name: Build initramfs (casper hooks)
+        run: |
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
+          set -e
+          KVER=$(ls /lib/modules | sort -V | tail -n1)
+          echo "Building initramfs for kernel $KVER"
+          update-initramfs -u -k "$KVER"
+          SCRIPT
+
+      - name: Unmount proc/sys/dev before mksquashfs
+        run: |
+          set +e
+          sudo umount -lf ${{ github.workspace }}/build/chroot/dev/pts || true
+          sudo umount -lf ${{ github.workspace }}/build/chroot/dev  || true
+          sudo umount -lf ${{ github.workspace }}/build/chroot/proc || true
+          sudo umount -lf ${{ github.workspace }}/build/chroot/sys  || true
+          sudo umount -lf ${{ github.workspace }}/build/chroot/run  || true
+          mount | grep chroot || echo "All chroot mounts released"
+          df -h
+
+      - name: Compress chroot into filesystem.squashfs
+        run: |
+          sudo mksquashfs ${{ github.workspace }}/build/chroot \
+            ${{ github.workspace }}/build/image/casper/filesystem.squashfs \
+            -comp zstd -Xcompression-level 19 -b 1M -noappend -e boot
+          printf '%s\n' "$(sudo du -sx --block-size=1 ${{ github.workspace }}/build/chroot | cut -f1)" | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.size > /dev/null
+          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash -c \
+            "dpkg-query -W --showformat='\${Package} \${Version}\n'" \
+            | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.manifest > /dev/null
+          cat <<'EOF' | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.manifest-remove > /dev/null
+casper
+lupin-casper
+EOF
+
+      - name: Copy kernel and initrd to casper
+        run: |
+          set -e
+          KVER=$(ls ${{ github.workspace }}/build/chroot/boot/vmlinuz-* | sed 's|.*vmlinuz-||' | sort -V | tail -n1)
+          echo "Using kernel version: $KVER"
+          sudo cp ${{ github.workspace }}/build/chroot/boot/vmlinuz-$KVER ${{ github.workspace }}/build/image/casper/vmlinuz
+          sudo cp ${{ github.workspace }}/build/chroot/boot/initrd.img-$KVER ${{ github.workspace }}/build/image/casper/initrd
+          sudo cp ${{ github.workspace }}/build/chroot/boot/vmlinuz-$KVER ${{ github.workspace }}/build/image/vmlinuz
+          sudo cp ${{ github.workspace }}/build/chroot/boot/initrd.img-$KVER ${{ github.workspace }}/build/image/initrd
+
+      - name: Create isolinux config for BIOS boot
+        run: |
+          sudo cp /usr/lib/ISOLINUX/isolinux.bin ${{ github.workspace }}/build/image/isolinux/isolinux.bin
+          sudo cp /usr/lib/syslinux/modules/bios/ldlinux.c32 ${{ github.workspace }}/build/image/isolinux/ldlinux.c32 2>/dev/null || \
+            sudo cp /usr/lib/ISOLINUX/ldlinux.c32 ${{ github.workspace }}/build/image/isolinux/ldlinux.c32
+          sudo cp /usr/lib/syslinux/modules/bios/menu.c32 ${{ github.workspace }}/build/image/isolinux/menu.c32 2>/dev/null || true
+          sudo cp /usr/lib/syslinux/modules/bios/libutil.c32 ${{ github.workspace }}/build/image/isolinux/libutil.c32 2>/dev/null || true
+
+          cat > ${{ github.workspace }}/build/image/isolinux/isolinux.cfg <<'EOF'
+          UI menu.c32
+          PROMPT 0
+          TIMEOUT 100
+          DEFAULT live
+
+          MENU TITLE MultyBuntu Live ISO (BIOS)
+
+          LABEL live
+              MENU LABEL ^MultyBuntu Live (BIOS)
+              KERNEL /casper/vmlinuz
+              INITRD /casper/initrd
+              APPEND boot=casper live-media-path=/casper quiet ---
+
+          LABEL live-nosplash
+              MENU LABEL MultyBuntu Live (Safe mode, verbose)
+              KERNEL /casper/vmlinuz
+              INITRD /casper/initrd
+              APPEND boot=casper live-media-path=/casper quiet ---
+
+          LABEL hd
+              MENU LABEL ^Boot from Hard Drive
+              LOCALBOOT 0x80
+          EOF
+
+      - name: Create GRUB config for UEFI boot
+        run: |
+          cat > ${{ github.workspace }}/build/image/boot/grub/grub.cfg <<'EOF'
+          set default=0
+          set timeout=10
+
+          insmod all_video
+          insmod part_gpt
+          insmod part_msdos
+          insmod fat
+          insmod iso9660
+          insmod udf
+          insmod loopback
+          insmod search_fs_uuid
+          insmod search_fs_file
+          insmod search_label
+          insmod chain
+
+          menuentry "MultyBuntu Live (UEFI)" {
+              search --no-floppy --label MULTYBUNTU --set=root
+              linux /casper/vmlinuz boot=casper live-media-path=/casper quiet ---
+              initrd /casper/initrd
+          }
+
+          menuentry "MultyBuntu Live (UEFI, safe mode)" {
+              search --no-floppy --label MULTYBUNTU --set=root
+              linux /casper/vmlinuz boot=casper live-media-path=/casper quiet ---
+              initrd /casper/initrd
+          }
+
+          menuentry "Boot from Hard Drive" {
+              search --no-floppy --file /EFI/BOOT/BOOTX64.EFI --set=root
+              chainloader /EFI/BOOT/BOOTX64.EFI
+          }
+          EOF
+
+      - name: Build EFI boot image (efi.img via grub-mkstandalone)
+        run: |
+          set -e
+          WORK=${{ github.workspace }}/build/image
+          mkdir -p $WORK/EFI/boot
+          grub-mkstandalone \
+            --format=x86_64-efi \
+            --output=$WORK/EFI/boot/bootx64.efi \
+            --locales="" \
+            --fonts="" \
+            --modules="part_gpt part_msdos fat iso9660 udf loopback search_fs_uuid search_fs_file search_label normal linux initrd chain" \
+            "boot/grub/grub.cfg=$WORK/boot/grub/grub.cfg"
+
+          dd if=/dev/zero of=$WORK/boot/efi.img bs=1M count=20
+          mkfs.vfat -F 32 -n EFIBOOT $WORK/boot/efi.img
+          mmd -i $WORK/boot/efi.img ::/EFI
+          mmd -i $WORK/boot/efi.img ::/EFI/BOOT
+          mcopy -i $WORK/boot/efi.img $WORK/EFI/boot/bootx64.efi ::/EFI/BOOT/BOOTX64.EFI
+
+      - name: Create "pre-installed programs" on ISO root
+        run: |
+          set -e
+          DEST="${{ github.workspace }}/build/image/pre-installed programs"
+          sudo mkdir -p "$DEST"
+          CHROOT="${{ github.workspace }}/build/chroot"
+
+          for app in qbittorrent steam krita libreoffice gparted htop btop; do
+            for src in "$CHROOT"/usr/share/applications/${app}.desktop "$CHROOT"/usr/share/applications/*${app}*.desktop; do
+              if [ -f "$src" ]; then
+                sudo cp "$src" "$DEST/" 2>/dev/null || true
+              fi
+            done
+          done
+
+          for f in org.qbittorrent.qBittorrent.desktop steam.desktop krita.desktop libreoffice-startcenter.desktop gparted.desktop htop.desktop btop.desktop; do
+            [ -f "$CHROOT/usr/share/applications/$f" ] && sudo cp "$CHROOT/usr/share/applications/$f" "$DEST/" || true
+          done
+
+          sudo chmod -R 755 "$DEST"
+
+      - name: Generate md5 sums and create ISO
+        run: |
+          set -e
+          cd ${{ github.workspace }}/build/image
+          sudo find . -type f ! -name 'md5sum.txt' -print0 | sudo xargs -0 -r md5sum | sudo tee md5sum.txt > /dev/null
+
+          ISOHDPFX=$(find /usr/lib -name isohdpfx.bin 2>/dev/null | head -n1)
+          if [ -z "$ISOHDPFX" ]; then
+            echo "ERROR: isohdpfx.bin not found (install syslinux-common)"
+            exit 1
+          fi
+          echo "Using isohdpfx.bin: $ISOHDPFX"
+
+          sudo xorriso -as mkisofs \
+            -iso-level 3 \
+            -full-iso9660-filenames \
+            -volid "MULTYBUNTU" \
+            -appid "MultyBuntu Live" \
+            -publisher "MultyBuntu" \
+            -preparer "MultyBuntu Build" \
+            -isohybrid-mbr "$ISOHDPFX" \
+            -eltorito-boot isolinux/isolinux.bin \
+            -eltorito-catalog isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot \
+            -e boot/efi.img \
+            -no-emul-boot \
+            -isohybrid-gpt-basdat \
+            -output ${{ github.workspace }}/MultyBuntu.iso \
+            .
+
+      - name: Verify ISO
+        run: |
+          ls -lh ${{ github.workspace }}/MultyBuntu.iso
+          file ${{ github.workspace }}/MultyBuntu.iso
+          echo "--- El Torito boot records ---"
+          xorriso -indev ${{ github.workspace }}/MultyBuntu.iso \
+                  -report_el_torito plain
+
+      - name: Upload MultyBuntu.iso as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultyBuntu-iso
+          path: ${{ github.workspace }}/MultyBuntu.iso
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Cleanup mounts (post-build)
+        if: always()
+        run: |
+          set +e
+          for m in dev/pts dev proc sys run; do
+            sudo umount -lf ${{ github.workspace }}/build/chroot/$m || true
+          done
