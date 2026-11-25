@@ -419,14 +419,14 @@ jobs:
           sudo mksquashfs ${{ github.workspace }}/build/chroot \
             ${{ github.workspace }}/build/image/casper/filesystem.squashfs \
             -comp zstd -Xcompression-level 19 -b 1M -noappend -e boot
+          
           printf '%s\n' "$(sudo du -sx --block-size=1 ${{ github.workspace }}/build/chroot | cut -f1)" | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.size > /dev/null
+          
           sudo chroot ${{ github.workspace }}/build/chroot /bin/bash -c \
             "dpkg-query -W --showformat='\${Package} \${Version}\n'" \
             | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.manifest > /dev/null
-          cat <<'EOF' | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.manifest-remove > /dev/null
-casper
-lupin-casper
-EOF
+          
+          printf 'casper\nlupin-casper\n' | sudo tee ${{ github.workspace }}/build/image/casper/filesystem.manifest-remove > /dev/null
 
       - name: Copy kernel and initrd to casper
         run: |
