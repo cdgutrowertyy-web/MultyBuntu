@@ -53,7 +53,8 @@ jobs:
             dosfstools \
             wget \
             curl \
-            rsync
+            rsync \
+            openssl
 
       - name: Prepare build workspace
         run: |
@@ -62,7 +63,7 @@ jobs:
       - name: Bootstrap Ubuntu 24.04 (noble) base system
         run: |
           sudo debootstrap --arch=amd64 --variant=minbase \
-            --include=ca-certificates,apt-utils,locales,tzdata \
+            --include=ca-certificates,apt-utils,locales,tzdata,openssl \
             noble ${{ github.workspace }}/build/chroot \
             https://archive.ubuntu.com/ubuntu/
 
@@ -232,8 +233,11 @@ jobs:
             groupadd -f "$g" || true
           done
           useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,lpadmin,scanner,bluetooth -c 'Multy User' multy || true
-          echo 'multy:multy' | chpasswd
-          echo 'root:root' | chpasswd
+          
+          # Установка пароля напрямую в /etc/shadow, минуя PAM, чтобы не падало в chroot
+          HASH=$(openssl passwd -6 multy)
+          echo "multy:$HASH" | chpasswd -e
+          
           echo 'multy ALL=(ALL) ALL' > /etc/sudoers.d/multy
           chmod 440 /etc/sudoers.d/multy
           SCRIPT
