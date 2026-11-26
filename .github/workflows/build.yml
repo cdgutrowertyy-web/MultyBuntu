@@ -18,12 +18,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify wallpaper asset exists
+      - name: Verify assets exist
         run: |
-          if [ ! -f files/wallpaper.png ]; then
-            echo "ERROR: files/wallpaper.png not found in repository!"
-            exit 1
-          fi
+          for f in wallpaper.png wallpaper1.png wallpaper2.png wallpaper3.png installer.png; do
+            if [ ! -f "files/$f" ]; then
+              echo "ERROR: files/$f not found in repository!"
+              exit 1
+            fi
+          done
 
       - name: Free disk space on runner
         run: |
@@ -156,7 +158,11 @@ jobs:
             squashfs-tools \
             xorriso \
             initramfs-tools \
-            systemd-sysv
+            systemd-sysv \
+            calamares \
+            calamares-settings-ubuntu \
+            partitionmanager \
+            ubuntu-drivers-common
           SCRIPT
 
       - name: Install Firefox (Mozilla APT repo, not snap)
@@ -267,10 +273,34 @@ jobs:
           ln -sf /lib/systemd/system/graphical.target /etc/systemd/system/default.target
           SCRIPT
 
-      - name: Configure KDE keyboard layout (kxkbrc)
+      - name: Configure KDE (Breeze Dark, Layout, Wallpapers)
         run: |
+          set -e
+          # Копируем обои в систему
+          sudo mkdir -p ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images
+          sudo cp files/wallpaper.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/3840x2160.png
+          sudo cp files/wallpaper1.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/wallpaper1.png
+          sudo cp files/wallpaper2.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/wallpaper2.png
+          sudo cp files/wallpaper3.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/wallpaper3.png
+
           sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
           set -e
+
+          # Метадата обоев
+          cat > /usr/share/wallpapers/MultyBuntu/metadata.json <<'EOF'
+          {
+              "KPlugin": {
+                  "Id": "MultyBuntu",
+                  "Name": "MultyBuntu Default",
+                  "License": "GPL",
+                  "Authors": [{"Name": "MultyBuntu"}]
+              },
+              "X-KDE-PluginInfo-Author": "MultyBuntu",
+              "X-KDE-PluginInfo-Name": "MultyBuntu"
+          }
+          EOF
+
+          # Настройки раскладки KDE
           mkdir -p /etc/skel/.config
           cat > /etc/skel/.config/kxkbrc <<'EOF'
           [Layout]
@@ -288,34 +318,14 @@ jobs:
           VariantList=,
           EOF
 
-          mkdir -p /home/multy/.config
-          cp /etc/skel/.config/kxkbrc /home/multy/.config/kxkbrc
-          chown -R multy:multy /home/multy/.config
-          SCRIPT
-
-      - name: Install wallpaper for KDE Plasma and SDDM
-        run: |
-          set -e
-          sudo mkdir -p ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images
-          sudo cp files/wallpaper.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/3840x2160.png
-          sudo cp files/wallpaper.png ${{ github.workspace }}/build/chroot/usr/share/wallpapers/MultyBuntu/contents/images/1920x1080.png
-
-          sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
-          set -e
-
-          cat > /usr/share/wallpapers/MultyBuntu/metadata.json <<'EOF'
-          {
-              "KPlugin": {
-                  "Id": "MultyBuntu",
-                  "Name": "MultyBuntu Default",
-                  "License": "GPL",
-                  "Authors": [{"Name": "MultyBuntu"}]
-              },
-              "X-KDE-PluginInfo-Author": "MultyBuntu",
-              "X-KDE-PluginInfo-Name": "MultyBuntu"
-          }
+          # Включаем ТЕМНУЮ ТЕМУ Breeze по умолчанию
+          cat > /etc/skel/.config/kdeglobals <<'EOF'
+          [KDE]
+          LookAndFeelPackage=org.kde.breezedark.desktop
+          ColorScheme=BreezeDark
           EOF
 
+          # Ставим обои по умолчанию
           mkdir -p /etc/skel/.config
           cat > /etc/skel/.config/plasma-org.kde.plasma.desktop-appletsrc <<'EOF'
           [Containments][1]
@@ -332,9 +342,12 @@ jobs:
           EOF
 
           mkdir -p /home/multy/.config
+          cp /etc/skel/.config/kxkbrc /home/multy/.config/kxkbrc
+          cp /etc/skel/.config/kdeglobals /home/multy/.config/kdeglobals
           cp /etc/skel/.config/plasma-org.kde.plasma.desktop-appletsrc /home/multy/.config/
           chown -R multy:multy /home/multy/.config
 
+          # Настройки SDDM (фон экрана входа)
           mkdir -p /etc/sddm.conf.d
           cat > /etc/sddm.conf.d/20-theme.conf <<'EOF'
           [Theme]
@@ -350,11 +363,17 @@ jobs:
           EOF
           SCRIPT
 
-      - name: Create Desktop shortcut (Firefox) and Readmy txt for skel
+      - name: Create Desktop shortcuts (Firefox, Installer, README)
         run: |
+          set -e
+          # Копируем иконку установщика
+          sudo mkdir -p ${{ github.workspace }}/build/chroot/usr/share/icons/hicolor/256x256/apps
+          sudo cp files/installer.png ${{ github.workspace }}/build/chroot/usr/share/icons/hicolor/256x256/apps/multy-installer.png
+
           sudo chroot ${{ github.workspace }}/build/chroot /bin/bash <<'SCRIPT'
           set -e
           mkdir -p /etc/skel/Desktop
+          
           cat > '/etc/skel/Desktop/firefox.desktop' <<'EOF'
           [Desktop Entry]
           Version=1.0
@@ -370,6 +389,20 @@ jobs:
           StartupNotify=true
           EOF
           chmod +x '/etc/skel/Desktop/firefox.desktop'
+
+          # Ярлык Установщика
+          cat > '/etc/skel/Desktop/install-multybuntu.desktop' <<'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Установить MultyBuntu
+          Comment=Установить систему на жесткий диск
+          Exec=sudo calamares
+          Icon=multy-installer
+          Terminal=true
+          Categories=System;
+          EOF
+          chmod +x '/etc/skel/Desktop/install-multybuntu.desktop'
 
           cat > '/etc/skel/Desktop/README.txt' <<'EOF'
           Предустановленные программы: см. папку "pre-installed programs" в корне загрузочного ISO-диска.
@@ -516,7 +549,6 @@ jobs:
           WORK=${{ github.workspace }}/build/image
           mkdir -p $WORK/EFI/boot
           
-          # УБРАН initrd ИЗ СПИСКА МОДУЛЕЙ (вызывал ошибку)
           grub-mkstandalone \
             --format=x86_64-efi \
             --output=$WORK/EFI/boot/bootx64.efi \
@@ -558,7 +590,6 @@ jobs:
           cd ${{ github.workspace }}/build/image
           sudo find . -type f ! -name 'md5sum.txt' -print0 | sudo xargs -0 -r md5sum | sudo tee md5sum.txt > /dev/null
 
-          # УЛУЧШЕН ПОИСК isohdpfx.bin (поиск по всему /usr/lib и /usr/share)
           ISOHDPFX=$(find /usr -name isohdpfx.bin 2>/dev/null | head -n1)
           if [ -z "$ISOHDPFX" ]; then
             echo "ERROR: isohdpfx.bin not found (install syslinux-common)"
